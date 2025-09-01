@@ -1,0 +1,4 @@
+### Get all customers
+GET http://localhost:5000/api/customers
+Content-Type: application/json
+
