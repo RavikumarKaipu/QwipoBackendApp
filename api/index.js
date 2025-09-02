@@ -1,5 +1,5 @@
 const express = require('express');
-const sqlite3 = require('sqlite3');
+const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const cors = require('cors');
 const fs = require('fs');
@@ -10,18 +10,23 @@ app.use(cors());
 app.use(express.json());
 
 // ----- SQLite setup with /tmp for Vercel -----
-const sourceDbPath = path.join(__dirname, 'database.db'); // original db bundled in repo
+const sourceDbPath = path.join(__dirname, 'database.db'); // your bundled DB
 const tempDbPath = path.join('/tmp', 'database.db');
 
-// Copy DB to /tmp if not already there
-if (!fs.existsSync(tempDbPath)) {
-  fs.copyFileSync(sourceDbPath, tempDbPath);
-  console.log('SQLite DB copied to /tmp');
+// On Vercel, copy DB to /tmp (ephemeral writable storage)
+if (process.env.VERCEL) {
+  if (!fs.existsSync(tempDbPath)) {
+    fs.copyFileSync(sourceDbPath, tempDbPath);
+    console.log('SQLite DB copied to /tmp for Vercel runtime');
+  }
 }
+
+// Use /tmp on Vercel, local file otherwise
+const dbPath = process.env.VERCEL ? tempDbPath : sourceDbPath;
 
 async function getDB() {
   return open({
-    filename: tempDbPath,
+    filename: dbPath,
     driver: sqlite3.Database,
   });
 }
@@ -48,6 +53,17 @@ async function initDB() {
 }
 initDB();
 
+// Middleware: ensure DB is initialized before handling routes
+app.use(async (req, res, next) => {
+  try {
+    await initDB();
+    next();
+  } catch (err) {
+    console.error('DB init failed:', err);
+    res.status(500).json({ error: 'Database initialization failed' });
+  }
+});
+
 // ----- Routes -----
 app.get('/', (req, res) => {
   const now = new Date();
@@ -57,7 +73,9 @@ app.get('/', (req, res) => {
 // Create customer
 app.post('/api/customers', async (req, res) => {
   const { first_name, last_name, phone_number, address_details, city, state, pin_code } = req.body;
-  if (!first_name || !last_name || !phone_number) return res.status(400).json({ error: 'Name and phone required' });
+  if (!first_name || !last_name || !phone_number) {
+    return res.status(400).json({ error: 'Name and phone required' });
+  }
 
   const db = await getDB();
   const existing = await db.get('SELECT id FROM customers WHERE phone_number = ?', [phone_number]);
@@ -66,8 +84,10 @@ app.post('/api/customers', async (req, res) => {
     return res.status(400).json({ error: 'Phone number already exists' });
   }
 
-  const result = await db.run('INSERT INTO customers (first_name, last_name, phone_number) VALUES (?, ?, ?)',
-    [first_name, last_name, phone_number]);
+  const result = await db.run(
+    'INSERT INTO customers (first_name, last_name, phone_number) VALUES (?, ?, ?)',
+    [first_name, last_name, phone_number]
+  );
   const customerId = result.lastID;
 
   if (address_details && city && state && pin_code) {
@@ -95,8 +115,10 @@ app.put('/api/customers/:id', async (req, res) => {
     return res.status(400).json({ error: 'Phone number already exists' });
   }
 
-  await db.run('UPDATE customers SET first_name = ?, last_name = ?, phone_number = ? WHERE id = ?',
-    [first_name, last_name, phone_number, id]);
+  await db.run(
+    'UPDATE customers SET first_name = ?, last_name = ?, phone_number = ? WHERE id = ?',
+    [first_name, last_name, phone_number, id]
+  );
   await db.close();
   res.json({ message: 'Customer updated' });
 });
@@ -106,6 +128,7 @@ app.get('/api/customers', async (req, res) => {
   const { page = 1, limit = 5, city, state, pin_code } = req.query;
   const db = await getDB();
   const offset = (page - 1) * limit;
+
   let sql = `SELECT c.*, COUNT(a.id) as address_count
              FROM customers c
              LEFT JOIN addresses a ON c.id = a.customer_id`;
@@ -149,7 +172,9 @@ app.delete('/api/customers/:id', async (req, res) => {
 app.post('/api/customers/:id/addresses', async (req, res) => {
   const { id } = req.params;
   const { address_details, city, state, pin_code } = req.body;
-  if (!address_details || !city || !state || !pin_code) return res.status(400).json({ error: 'All address fields required' });
+  if (!address_details || !city || !state || !pin_code) {
+    return res.status(400).json({ error: 'All address fields required' });
+  }
 
   const db = await getDB();
   const result = await db.run(
@@ -175,8 +200,10 @@ app.put('/api/addresses/:addressId', async (req, res) => {
   const { address_details, city, state, pin_code } = req.body;
 
   const db = await getDB();
-  await db.run('UPDATE addresses SET address_details=?, city=?, state=?, pin_code=? WHERE id=?',
-    [address_details, city, state, pin_code, addressId]);
+  await db.run(
+    'UPDATE addresses SET address_details=?, city=?, state=?, pin_code=? WHERE id=?',
+    [address_details, city, state, pin_code, addressId]
+  );
   await db.close();
   res.json({ message: 'Address updated' });
 });
@@ -190,5 +217,10 @@ app.delete('/api/addresses/:addressId', async (req, res) => {
   res.json({ message: 'Address deleted' });
 });
 
-// Export app for Vercel
+// ----- Local dev vs Vercel export -----
+if (require.main === module) {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
+
 module.exports = app;

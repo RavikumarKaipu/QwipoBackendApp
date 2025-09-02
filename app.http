@@ -2,3 +2,5 @@
 GET http://localhost:5000/api/customers
 Content-Type: application/json
 
+###
+GET https://qwipo-backend-app.vercel.app/
