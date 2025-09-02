@@ -2,35 +2,31 @@ const express = require('express');
 const sqlite3 = require('sqlite3');
 const { open } = require('sqlite');
 const cors = require('cors');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Use /tmp/database.db for serverless writable storage
-const DB_FILE = path.join('/tmp', 'database.db');
+// ----- SQLite setup with /tmp for Vercel -----
+const sourceDbPath = path.join(__dirname, 'database.db'); // original db bundled in repo
+const tempDbPath = path.join('/tmp', 'database.db');
 
-// Copy default database if not exists (first run)
-if (!fs.existsSync(DB_FILE)) {
-  const defaultDB = path.join(__dirname, 'database.db');
-  if (fs.existsSync(defaultDB)) {
-    fs.copyFileSync(defaultDB, DB_FILE);
-  } else {
-    // create empty database file
-    fs.writeFileSync(DB_FILE, '');
-  }
+// Copy DB to /tmp if not already there
+if (!fs.existsSync(tempDbPath)) {
+  fs.copyFileSync(sourceDbPath, tempDbPath);
+  console.log('SQLite DB copied to /tmp');
 }
 
 async function getDB() {
   return open({
-    filename: DB_FILE,
+    filename: tempDbPath,
     driver: sqlite3.Database,
   });
 }
 
-// Initialize database if tables do not exist
+// Initialize tables if needed
 async function initDB() {
   const db = await getDB();
   await db.exec(`CREATE TABLE IF NOT EXISTS customers (
@@ -52,17 +48,16 @@ async function initDB() {
 }
 initDB();
 
-// ---------------- ROUTES ----------------
+// ----- Routes -----
 app.get('/', (req, res) => {
   const now = new Date();
-  res.status(200).json({ message: `Server running. Current time: ${now.toLocaleString()}` });
+  res.json({ message: `Server is running: ${now.toLocaleString()}` });
 });
 
 // Create customer
 app.post('/api/customers', async (req, res) => {
   const { first_name, last_name, phone_number, address_details, city, state, pin_code } = req.body;
-  if (!first_name || !last_name || !phone_number)
-    return res.status(400).json({ error: 'Name and phone required' });
+  if (!first_name || !last_name || !phone_number) return res.status(400).json({ error: 'Name and phone required' });
 
   const db = await getDB();
   const existing = await db.get('SELECT id FROM customers WHERE phone_number = ?', [phone_number]);
@@ -71,10 +66,8 @@ app.post('/api/customers', async (req, res) => {
     return res.status(400).json({ error: 'Phone number already exists' });
   }
 
-  const result = await db.run(
-    'INSERT INTO customers (first_name, last_name, phone_number) VALUES (?, ?, ?)',
-    [first_name, last_name, phone_number]
-  );
+  const result = await db.run('INSERT INTO customers (first_name, last_name, phone_number) VALUES (?, ?, ?)',
+    [first_name, last_name, phone_number]);
   const customerId = result.lastID;
 
   if (address_details && city && state && pin_code) {
@@ -82,10 +75,30 @@ app.post('/api/customers', async (req, res) => {
       'INSERT INTO addresses (customer_id, address_details, city, state, pin_code) VALUES (?, ?, ?, ?, ?)',
       [customerId, address_details, city, state, pin_code]
     );
+    await db.close();
+    return res.json({ message: 'Customer + Address created', customer_id: customerId });
   }
 
   await db.close();
-  res.json({ message: 'Customer created', customer_id: customerId });
+  res.json({ message: 'Customer created (no address)', customer_id: customerId });
+});
+
+// Update customer
+app.put('/api/customers/:id', async (req, res) => {
+  const { id } = req.params;
+  const { first_name, last_name, phone_number } = req.body;
+
+  const db = await getDB();
+  const duplicate = await db.get('SELECT id FROM customers WHERE phone_number = ? AND id != ?', [phone_number, id]);
+  if (duplicate) {
+    await db.close();
+    return res.status(400).json({ error: 'Phone number already exists' });
+  }
+
+  await db.run('UPDATE customers SET first_name = ?, last_name = ?, phone_number = ? WHERE id = ?',
+    [first_name, last_name, phone_number, id]);
+  await db.close();
+  res.json({ message: 'Customer updated' });
 });
 
 // Get all customers
@@ -93,8 +106,7 @@ app.get('/api/customers', async (req, res) => {
   const { page = 1, limit = 5, city, state, pin_code } = req.query;
   const db = await getDB();
   const offset = (page - 1) * limit;
-
-  let sql = `SELECT c.*, COUNT(a.id) AS address_count
+  let sql = `SELECT c.*, COUNT(a.id) as address_count
              FROM customers c
              LEFT JOIN addresses a ON c.id = a.customer_id`;
   const filters = [];
@@ -115,8 +127,9 @@ app.get('/api/customers', async (req, res) => {
 
 // Get customer by ID
 app.get('/api/customers/:id', async (req, res) => {
+  const { id } = req.params;
   const db = await getDB();
-  const customer = await db.get('SELECT * FROM customers WHERE id = ?', [req.params.id]);
+  const customer = await db.get('SELECT * FROM customers WHERE id = ?', [id]);
   await db.close();
   if (!customer) return res.status(404).json({ error: 'Customer not found' });
   res.json({ message: 'success', data: customer });
@@ -124,28 +137,58 @@ app.get('/api/customers/:id', async (req, res) => {
 
 // Delete customer
 app.delete('/api/customers/:id', async (req, res) => {
+  const { id } = req.params;
   const db = await getDB();
-  await db.run('DELETE FROM addresses WHERE customer_id = ?', [req.params.id]);
-  await db.run('DELETE FROM customers WHERE id = ?', [req.params.id]);
+  await db.run('DELETE FROM addresses WHERE customer_id = ?', [id]);
+  await db.run('DELETE FROM customers WHERE id = ?', [id]);
   await db.close();
   res.json({ message: 'Customer deleted' });
 });
 
-// Address routes
+// Add address
 app.post('/api/customers/:id/addresses', async (req, res) => {
+  const { id } = req.params;
   const { address_details, city, state, pin_code } = req.body;
-  if (!address_details || !city || !state || !pin_code)
-    return res.status(400).json({ error: 'All address fields required' });
+  if (!address_details || !city || !state || !pin_code) return res.status(400).json({ error: 'All address fields required' });
 
   const db = await getDB();
   const result = await db.run(
     'INSERT INTO addresses (customer_id, address_details, city, state, pin_code) VALUES (?, ?, ?, ?, ?)',
-    [req.params.id, address_details, city, state, pin_code]
+    [id, address_details, city, state, pin_code]
   );
   await db.close();
   res.json({ message: 'Address added', address_id: result.lastID });
 });
 
-// Start server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Get addresses
+app.get('/api/customers/:id/addresses', async (req, res) => {
+  const { id } = req.params;
+  const db = await getDB();
+  const rows = await db.all('SELECT * FROM addresses WHERE customer_id = ?', [id]);
+  await db.close();
+  res.json({ message: 'success', data: rows });
+});
+
+// Update address
+app.put('/api/addresses/:addressId', async (req, res) => {
+  const { addressId } = req.params;
+  const { address_details, city, state, pin_code } = req.body;
+
+  const db = await getDB();
+  await db.run('UPDATE addresses SET address_details=?, city=?, state=?, pin_code=? WHERE id=?',
+    [address_details, city, state, pin_code, addressId]);
+  await db.close();
+  res.json({ message: 'Address updated' });
+});
+
+// Delete address
+app.delete('/api/addresses/:addressId', async (req, res) => {
+  const { addressId } = req.params;
+  const db = await getDB();
+  await db.run('DELETE FROM addresses WHERE id=?', [addressId]);
+  await db.close();
+  res.json({ message: 'Address deleted' });
+});
+
+// Export app for Vercel
+module.exports = app;
